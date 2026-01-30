@@ -1,0 +1,19 @@
+resolution 640 360
+
+# Pretend we're rendering at 60 fps. This just sets the delta time between
+# frames so that it's consistent. The default is real-time.
+framerate 60
+
+# This mostly just reduces noise in the results. The point is to measure the
+# performance of the LLVM target, which we can measure perfectly well on a
+# single thread.
+multithreading off
+
+# TODO benchmark suite
+run benchmarks/toy/a_dead_planet_of_silicon_dreams_by_mrange.glsl 5
+print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
+
+run benchmarks/toy/starry_planes_by_mrange.glsl 100
+print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
+
+print Final score: ${geomean median frame-time} (lower is better) (stddev: ${geomean stddev frame-time})

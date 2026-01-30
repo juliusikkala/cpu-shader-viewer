@@ -5,6 +5,10 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <sstream>
+#include <cmath>
+#include <algorithm>
+#include <format>
 
 #include "slang.h"
 #include "slang-com-ptr.h"
@@ -23,7 +27,7 @@ struct ShaderViewerConstants
 struct RunnerGlobalParams
 {
     ShaderViewerConstants* constants;
-    uint8_t* pixelData;
+    uint32_t* pixelData;
     size_t pixelDataSize;
 };
 
@@ -32,7 +36,7 @@ typedef void (*computeGroupEntryPoint)(
     void* entryPointParams,
     RunnerGlobalParams* globalParams);
 
-struct viewer_resources
+struct ViewerResources
 {
     SDL_Window* window;
     SDL_Surface* surf;
@@ -52,12 +56,12 @@ template<typename... Args>
 void panic(Args&&... args)
 {
     ((int (*)(const char *, ...))printf)(args...);
-    abort();
+    exit(1);
 }
 
-viewer_resources init()
+ViewerResources init()
 {
-    viewer_resources res;
+    ViewerResources res;
 
     if (!SDL_Init(SDL_INIT_EVENTS|SDL_INIT_VIDEO))
         panic("Can't init, yikes. %s\n", SDL_GetError());
@@ -68,6 +72,9 @@ viewer_resources init()
         panic("Can't open window, yikes. %s\n", SDL_GetError());
 
     res.surf = SDL_GetWindowSurface(res.window);
+    if (!res.surf)
+        panic("Can't get window surface, yikes. %s\n", SDL_GetError());
+    SDL_ClearSurface(res.surf, 0, 0, 0, 0);
 
     SlangGlobalSessionDesc desc = {};
     desc.enableGLSL = true;
@@ -79,10 +86,20 @@ viewer_resources init()
     return res;
 }
 
-void deinit(viewer_resources& res)
+void deinit(ViewerResources& res)
 {
     SDL_DestroyWindow(res.window);
     SDL_Quit();
+}
+
+void setResolution(ViewerResources& res, int w, int h)
+{
+    SDL_SetWindowSize(res.window, w, h);
+    SDL_PumpEvents();
+    res.surf = SDL_GetWindowSurface(res.window);
+    SDL_ClearSurface(res.surf, 0, 0, 0, 0);
+    SDL_UpdateWindowSurface(res.window);
+    SDL_UpdateWindowSurface(res.window);
 }
 
 std::string readTextFile(const char* path)
@@ -109,7 +126,7 @@ std::string readTextFile(const char* path)
     return ret;
 }
 
-bool loadShaderFromSource(viewer_resources& res, const char* glslSource)
+bool loadShaderFromSource(ViewerResources& res, const char* glslSource)
 {
     res.entryPointFunc = nullptr;
 
@@ -135,7 +152,7 @@ ConstantBuffer<ShaderViewerConstants, CDataLayout> shaderViewerConstants;
     source += glslSource;
 
     source += R"(
-RWStructuredBuffer<uint8_t4> pixelData;
+RWStructuredBuffer<uint32_t> pixelData;
 )";
 
     std::string numStr = std::to_string(DISPATCH_TILE_SIZE);
@@ -152,7 +169,8 @@ void renderRunner(
     mainImage(color, p);
 
     uint i = dispatchThreadID.x + dispatchThreadID.y * shaderViewerConstants.pitch;
-    pixelData[i] = uint8_t4(saturate(color) * 255);
+    uint4 ucolor = uint4(saturate(color) * 255);
+    pixelData[i] = (ucolor.a << 24) | (ucolor.b << 16) | (ucolor.g << 8) | ucolor.r;
 }
 )";
 
@@ -164,7 +182,6 @@ void renderRunner(
         {slang::CompilerOptionName::DenormalModeFp16, {{}, SLANG_FP_DENORM_MODE_ANY}},
         {slang::CompilerOptionName::DenormalModeFp32, {{}, SLANG_FP_DENORM_MODE_ANY}},
         {slang::CompilerOptionName::DenormalModeFp64, {{}, SLANG_FP_DENORM_MODE_ANY}},
-        {slang::CompilerOptionName::LLVMCPU, {{}, 0, 0, "znver5"}},
         {slang::CompilerOptionName::DownstreamArgs, {{}, 0, 0, "llvm", "-vector-library=AMDLIBM"}}
         //{slang::CompilerOptionName::DumpIr, {{}, 1}}
     };
@@ -235,7 +252,7 @@ void renderRunner(
     return true;
 }
 
-bool loadShader(viewer_resources& res, const char* path)
+bool loadShader(ViewerResources& res, const char* path)
 {
     bool status = path ? 
         loadShaderFromSource(res, readTextFile(path).c_str()) : false;
@@ -252,7 +269,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     return status;
 }
 
-void renderTile(viewer_resources& res, int xTile, int yTile)
+void renderTile(ViewerResources& res, int xTile, int yTile)
 {
     if (res.entryPointFunc)
     {
@@ -261,7 +278,7 @@ void renderTile(viewer_resources& res, int xTile, int yTile)
     }
 }
 
-void renderFrame(viewer_resources& res, int width, int height)
+void renderFrameMultithread(ViewerResources& res, int width, int height)
 {
     int xTiles = (width + DISPATCH_TILE_SIZE - 1) / DISPATCH_TILE_SIZE;
     int yTiles = (height + DISPATCH_TILE_SIZE - 1) / DISPATCH_TILE_SIZE;
@@ -272,9 +289,27 @@ void renderFrame(viewer_resources& res, int width, int height)
         renderTile(res, x, y);
 }
 
-int main()
+void renderFrameSinglethread(ViewerResources& res, int width, int height)
 {
-    viewer_resources res = init();
+    int xTiles = (width + DISPATCH_TILE_SIZE - 1) / DISPATCH_TILE_SIZE;
+    int yTiles = (height + DISPATCH_TILE_SIZE - 1) / DISPATCH_TILE_SIZE;
+
+    for (int y = 0; y < yTiles; ++y)
+    for (int x = 0; x < xTiles; ++x)
+        renderTile(res, x, y);
+}
+
+void printUsage(FILE* out, char* programName)
+{
+    fprintf(out,
+        "Usage: %s [benchmark-command-list-file]\n"
+        "Check the README for how the benchmark command list works.\n",
+        programName);
+}
+
+void interactiveMain()
+{
+    ViewerResources res = init();
     loadShader(res, nullptr);
 
     uint64_t prevTicks = SDL_GetTicksNS();
@@ -283,7 +318,7 @@ int main()
     std::string activeShaderPath = "";
     SDL_Time shaderModifyTime;
 
-    std::vector<uint8_t> framebuffer;
+    std::vector<uint32_t> framebuffer;
 
     auto& params = *res.constants;
     params.frame = 0;
@@ -294,8 +329,6 @@ int main()
 
     bool valid = false;
 
-    uint8_t* pixelData;
-    size_t pixelDataSize;
     for(;;)
     {
         uint64_t curTicks = SDL_GetTicksNS();
@@ -351,16 +384,16 @@ int main()
             }
         }
 
-        framebuffer.resize(res.surf->w * res.surf->h * 4);
+        framebuffer.resize(res.surf->w * res.surf->h);
 
         res.globalParams.pixelData = framebuffer.data();
-        res.globalParams.pixelDataSize = framebuffer.size() / 4;
+        res.globalParams.pixelDataSize = framebuffer.size();
         params.pitch = res.surf->w;
         params.resX = res.surf->w;
         params.resY = res.surf->h;
         params.resZ = 1;
 
-        renderFrame(res, res.surf->w, res.surf->h);
+        renderFrameMultithread(res, res.surf->w, res.surf->h);
 
         SDL_LockSurface(res.surf);
         SDL_ConvertPixels(
@@ -376,5 +409,430 @@ int main()
 end:
 
     deinit(res);
+}
+
+void skipWhitespace(const char*& str)
+{
+    while(*str != 0 && strchr(" \t\n", *str)) str++;
+}
+
+std::string readUntilWhitespace(const char*& str)
+{
+    std::string token;
+    while (*str != ' ' && *str != '\t' && *str)
+    {
+        token += *str;
+        str++;
+    }
+    return token;
+}
+
+bool readDouble(const std::string& str, double& d)
+{
+    char* out = nullptr;
+    d = strtod(str.c_str(), &out);
+    return *out == 0;
+}
+
+std::vector<std::string> splitByWhitespace(const char* str)
+{
+    std::vector<std::string> args;
+    skipWhitespace(str);
+    while (*str)
+    {
+        args.push_back(readUntilWhitespace(str));
+        skipWhitespace(str);
+    }
+    return args;
+}
+
+float sum(const std::vector<float>& vals)
+{
+    float s = 0;
+    for (float v: vals)
+        s += v;
+    return s;
+}
+
+float mean(const std::vector<float>& vals)
+{
+    if (vals.size() == 0)
+        return 0.0f;
+
+    float s = 0;
+    for (float v: vals)
+        s += v;
+    return s / vals.size();
+}
+
+float min(const std::vector<float>& vals)
+{
+    if (vals.size() == 0)
+        return 0.0f;
+
+    float s = vals[0];
+    for (float v: vals)
+        s = v < s ? v : s;
+    return s;
+}
+
+float max(const std::vector<float>& vals)
+{
+    if (vals.size() == 0)
+        return 0.0f;
+
+    float s = vals[0];
+    for (float v: vals)
+        s = v > s ? v : s;
+    return s;
+}
+
+float median(const std::vector<float>& vals)
+{
+    if (vals.size() == 0)
+        return 0.0f;
+
+    // The brainlet algorithm.
+    std::vector<float> v = vals;
+    std::sort(v.begin(), v.end());
+    return v[v.size()/2];
+}
+
+float geomean(const std::vector<float>& vals)
+{
+    if (vals.size() == 0)
+        return 0.0f;
+
+    float s = 1.0;
+    for (float v: vals)
+        s *= v;
+    return pow(s, 1.0 / vals.size());
+}
+
+float harmonicMean(const std::vector<float>& vals)
+{
+    if (vals.size() == 0)
+        return 0.0f;
+
+    float s = 0;
+    for (float v: vals)
+        s += 1.0 / v;
+    return vals.size() / s;
+}
+
+float variance(const std::vector<float>& vals)
+{
+    float m = mean(vals);
+    float s = 0;
+    for (float v: vals)
+        s += (m-v) * (m-v);
+    return s / vals.size();
+}
+
+float collect(const std::vector<float>& vals, const char* cumulative)
+{
+    if (!cumulative)
+        return vals.size() == 0 ? 0 : vals.back();
+    else if (strcmp(cumulative, "sum") == 0)
+        return sum(vals);
+    else if (strcmp(cumulative, "mean") == 0)
+        return mean(vals);
+    else if (strcmp(cumulative, "min") == 0)
+        return min(vals);
+    else if (strcmp(cumulative, "max") == 0)
+        return max(vals);
+    else if (strcmp(cumulative, "median") == 0)
+        return median(vals);
+    else if (strcmp(cumulative, "geomean") == 0)
+        return geomean(vals);
+    else if (strcmp(cumulative, "harmonic-mean") == 0)
+        return harmonicMean(vals);
+    else if (strcmp(cumulative, "variance") == 0)
+        return variance(vals);
+    else if (strcmp(cumulative, "stddev") == 0)
+        return sqrt(variance(vals));
+    else
+        panic("Unknown cumulation prefix %s\n", cumulative);
+    return 0;
+}
+
+struct RunStats
+{
+    float buildTime;
+    std::vector<float> frames;
+};
+
+struct Stats
+{
+    std::vector<RunStats> runs;
+
+    void clear()
+    {
+        runs.clear();
+    }
+
+    float getStat(const std::string& spec)
+    {
+        float v = 0;
+        std::vector<std::string> specifiers = splitByWhitespace(spec.c_str());
+
+        if (specifiers.size() == 0)
+            panic("No variable name given!");
+
+        std::string var = specifiers.back();
+        specifiers.pop_back();
+
+        std::vector<float> stats;
+        if (var == "build-time")
+        {
+            for (RunStats r: runs)
+                stats.push_back(r.buildTime);
+        }
+        else if (var == "frame-time")
+        {
+            const char* cumulation = nullptr;
+            if (specifiers.size() >= 1)
+                cumulation = specifiers.back().c_str();
+
+            for (RunStats r: runs)
+                stats.push_back(collect(r.frames, cumulation));
+
+            if (cumulation)
+                specifiers.pop_back();
+        }
+        else
+            panic("Unknown variable %s\n", var.c_str());
+
+        if (specifiers.size() > 1)
+            panic("Too many cumulation prefixes in \"%s\"!\n", spec.c_str());
+
+        return collect(stats, specifiers.size() == 0 ? nullptr : specifiers.back().c_str());
+    }
+};
+
+void benchmarkRenderMain(ViewerResources& res, Stats& stats, const char* shaderPath, int frameCount, double forcedDeltaTime, bool multithreaded)
+{
+    RunStats run;
+
+    std::string shaderSource = readTextFile(shaderPath);
+
+    uint64_t buildStartTicks = SDL_GetTicksNS();
+    if (!loadShaderFromSource(res, shaderSource.c_str()))
+        panic("Failed to load shader %s\n", shaderPath);
+    uint64_t buildFinishTicks = SDL_GetTicksNS();
+    run.buildTime = (buildFinishTicks-buildStartTicks) * 1e-9;
+
+    auto& params = *res.constants;
+    params.frame = 0;
+    params.mouseX = 0;
+    params.mouseY = 0;
+    params.mouseClickX = 0;
+    params.mouseClickY = 0;
+
+    std::vector<uint32_t> framebuffer;
+    framebuffer.resize(res.surf->w * res.surf->h);
+
+    res.globalParams.pixelData = framebuffer.data();
+    res.globalParams.pixelDataSize = framebuffer.size();
+    params.pitch = res.surf->w;
+    params.resX = res.surf->w;
+    params.resY = res.surf->h;
+    params.resZ = 1;
+
+    uint64_t startTicks = SDL_GetTicksNS();
+    uint64_t cumulatedTicks = 0;
+
+    for (; params.frame < frameCount; ++params.frame)
+    {
+        uint64_t curTicks = SDL_GetTicksNS();
+        uint64_t deltaTicks = curTicks - startTicks;
+        if (forcedDeltaTime > 0)
+            deltaTicks = round(forcedDeltaTime * 1e9);
+
+        if (params.frame != 0)
+            cumulatedTicks += deltaTicks;
+
+        startTicks = curTicks;
+        params.time = cumulatedTicks * 1e-9;
+
+        // Avoid getting the "program is unresponsive" message.
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
+        {
+            switch (event.type)
+            {
+            case SDL_EVENT_QUIT:
+                panic("User interrupted benchmark.");
+                break;
+            }
+        }
+
+        uint64_t renderStartTicks = SDL_GetTicksNS();
+        if (multithreaded)
+            renderFrameMultithread(res, res.surf->w, res.surf->h);
+        else
+            renderFrameSinglethread(res, res.surf->w, res.surf->h);
+        uint64_t renderFinishTicks = SDL_GetTicksNS();
+
+        float frameTime = (renderFinishTicks - renderStartTicks) * 1e-9;
+        run.frames.push_back(frameTime);
+
+        SDL_LockSurface(res.surf);
+        SDL_ConvertPixels(
+            res.surf->w, res.surf->h, SDL_PIXELFORMAT_ABGR8888, framebuffer.data(),
+            res.surf->w * 4, res.surf->format, res.surf->pixels, res.surf->pitch);
+        SDL_UnlockSurface(res.surf);
+
+        SDL_UpdateWindowSurface(res.window);
+    }
+
+    stats.runs.emplace_back(run);
+}
+
+void benchmarkMain(const char* commandListPath)
+{
+    Stats stats;
+    ViewerResources res = init();
+    loadShader(res, nullptr);
+
+    std::string commandList = readTextFile(commandListPath);
+    std::istringstream input(commandList);
+
+    double forcedDeltaTime = -1.0;
+    bool multithreaded = true;
+
+    for (std::string command; std::getline(input, command);)
+    {
+        // Strip whitespace from command
+        const char* cmd = command.c_str();
+        skipWhitespace(cmd);
+
+        // Skip comments
+        if (*cmd == '#' || !*cmd)
+            continue;
+
+        // Read operation
+        std::string op = readUntilWhitespace(cmd);
+
+        // Skip first space after command, this is important for 'print'.
+        if (*cmd) cmd++;
+
+        std::vector<std::string> args = splitByWhitespace(cmd);
+
+        auto checkArgCount = [&](int count)
+        {
+            if (args.size() != count)
+            {
+                panic(
+                    "Incorrect number of arguments for %s: expected %d, got %d\n",
+                    op.c_str(), count, (int)args.size());
+            }
+        };
+
+        auto argDouble = [&](int index)
+        {
+            double val;
+            if (!::readDouble(args[index], val))
+                panic("%s: expected number in argument %d\n", op.c_str(), index+1);
+            return val;
+        };
+
+        if (op == "framerate")
+        {
+            checkArgCount(1);
+            forcedDeltaTime = 1.0 / argDouble(0);
+        }
+        else if (op == "clear")
+        {
+            checkArgCount(0);
+            stats.clear();
+        }
+        else if (op == "resolution")
+        {
+            checkArgCount(2);
+            int w = int(argDouble(0));
+            int h = int(argDouble(1));
+            w = w < 1 ? 1 : w;
+            h = h < 1 ? 1 : h;
+            w = w > 8192 ? 8192 : w;
+            h = h > 8192 ? 8192 : h;
+
+            w = (w+DISPATCH_TILE_SIZE-1)/DISPATCH_TILE_SIZE*DISPATCH_TILE_SIZE;
+            h = (h+DISPATCH_TILE_SIZE-1)/DISPATCH_TILE_SIZE*DISPATCH_TILE_SIZE;
+
+            setResolution(res, w, h);
+        }
+        else if (op == "multithreading")
+        {
+            checkArgCount(1);
+            if (args[0] == "on" || args[0] == "true")
+                multithreaded = true;
+            else
+                multithreaded = false;
+        }
+        else if (op == "run")
+        {
+            checkArgCount(2);
+            int numFrames = int(argDouble(1));
+            benchmarkRenderMain(res, stats, args[0].c_str(), numFrames, forcedDeltaTime, multithreaded);
+        }
+        else if (op == "print")
+        {
+            std::string output;
+
+            while (*cmd != 0)
+            {
+                if (cmd[0] == '$' && cmd[1] == '{')
+                {
+                    std::string spec;
+                    cmd += 2;
+                    while (*cmd && *cmd != '}')
+                    {
+                        spec += *cmd;
+                        cmd++;
+                    }
+
+                    if (*cmd == '}')
+                        cmd++;
+
+                    output += std::to_string(stats.getStat(spec));
+                }
+                else
+                {
+                    output.push_back(*cmd);
+                    cmd++;
+                }
+            }
+
+            printf("%s\n", output.c_str());
+        }
+        else
+        {
+            panic("Unrecognized command %s\n", op.c_str());
+        }
+    }
+
+    deinit(res);
+}
+
+int main(int argc, char** argv)
+{
+    if (argc <= 1)
+    {
+        // No args, interactive mode.
+        interactiveMain();
+        return 0;
+    }
+    else if (argc == 2)
+    {
+        benchmarkMain(argv[1]);
+        return 0;
+    }
+    else
+    {
+        printUsage(stdout, argv[0]);
+        return 1;
+    }
+
     return 0;
 }
