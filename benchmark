@@ -9,11 +9,25 @@ framerate 60
 # single thread.
 multithreading off
 
-# TODO benchmark suite
+print === Microbenchmarks ===
+
+run benchmarks/micro/uv.slang 4000
+print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
+
+run benchmarks/micro/trig.slang 500
+print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
+
+run benchmarks/micro/conditional.slang 2000
+print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
+
+print === Toy benchmarks ===
+
 run benchmarks/toy/a_dead_planet_of_silicon_dreams_by_mrange.glsl 5
 print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
 
 run benchmarks/toy/starry_planes_by_mrange.glsl 100
 print Build time: ${build-time}, median frametime: ${median frame-time}, total ${sum frame-time}
+
+print === Summary ===
 
 print Final score: ${geomean median frame-time} (lower is better) (stddev: ${geomean stddev frame-time})

@@ -8,6 +8,7 @@
 #include <sstream>
 #include <cmath>
 #include <algorithm>
+#include <filesystem>
 #include <format>
 
 #include "slang.h"
@@ -126,7 +127,12 @@ std::string readTextFile(const char* path)
     return ret;
 }
 
-bool loadShaderFromSource(ViewerResources& res, const char* glslSource)
+bool isPathToGLSL(const char* path)
+{
+    return std::filesystem::path(path).extension().string() == ".glsl";
+}
+
+bool loadShaderFromSource(ViewerResources& res, const char* shaderSource, bool allowGLSL)
 {
     res.entryPointFunc = nullptr;
 
@@ -149,7 +155,7 @@ ConstantBuffer<ShaderViewerConstants, CDataLayout> shaderViewerConstants;
 #define iTime shaderViewerConstants.time
 )";
 
-    source += glslSource;
+    source += shaderSource;
 
     source += R"(
 RWStructuredBuffer<uint32_t> pixelData;
@@ -174,8 +180,10 @@ void renderRunner(
 }
 )";
 
+    //printf("%s\n", source.c_str());
+
     slang::CompilerOptionEntry options[] = {
-        {slang::CompilerOptionName::AllowGLSL, {{}, 1}},
+        {slang::CompilerOptionName::AllowGLSL, {{}, allowGLSL ? 1 : 0}},
         {slang::CompilerOptionName::EmitCPUMethod, {{}, SLANG_EMIT_CPU_VIA_LLVM}},
         {slang::CompilerOptionName::Optimization, {{}, SLANG_OPTIMIZATION_LEVEL_MAXIMAL}},
         {slang::CompilerOptionName::FloatingPointMode, {{}, SLANG_FLOATING_POINT_MODE_FAST}},
@@ -194,7 +202,7 @@ void renderRunner(
     slang::SessionDesc sessionDesc;
     sessionDesc.targets = &target;
     sessionDesc.targetCount = 1;
-    sessionDesc.allowGLSLSyntax = true;
+    sessionDesc.allowGLSLSyntax = allowGLSL;
     sessionDesc.compilerOptionEntries = options;
     sessionDesc.compilerOptionEntryCount = std::size(options);
 
@@ -216,13 +224,15 @@ void renderRunner(
     Slang::ComPtr<slang::IEntryPoint> entryPoint;
     module->findEntryPointByName("renderRunner", entryPoint.writeRef());
     
-    slang::IModule* glsl = res.session->loadModule("glsl");
+    slang::IModule* glsl;
+    if (allowGLSL)
+        glsl = res.session->loadModule("glsl");
 
-    slang::IComponentType* components[] = {module, glsl, entryPoint};
+    slang::IComponentType* components[] = {module, entryPoint, glsl};
     Slang::ComPtr<slang::IComponentType> program;
     SlangResult err = res.session->createCompositeComponentType(
         components,
-        std::size(components),
+        allowGLSL ? 3 : 2,
         program.writeRef(),
         diagnosticBlob.writeRef());
     if (diagnosticBlob)
@@ -255,7 +265,7 @@ void renderRunner(
 bool loadShader(ViewerResources& res, const char* path)
 {
     bool status = path ? 
-        loadShaderFromSource(res, readTextFile(path).c_str()) : false;
+        loadShaderFromSource(res, readTextFile(path).c_str(), isPathToGLSL(path)) : false;
     if (!status)
     {
         const char* fallbackSource = R"(
@@ -264,7 +274,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     fragColor = vec4(1.0,0.0,0.0,1.0);
 }
 )";
-        loadShaderFromSource(res, fallbackSource);
+        loadShaderFromSource(res, fallbackSource, true);
     }
     return status;
 }
@@ -617,7 +627,7 @@ void benchmarkRenderMain(ViewerResources& res, Stats& stats, const char* shaderP
     std::string shaderSource = readTextFile(shaderPath);
 
     uint64_t buildStartTicks = SDL_GetTicksNS();
-    if (!loadShaderFromSource(res, shaderSource.c_str()))
+    if (!loadShaderFromSource(res, shaderSource.c_str(), isPathToGLSL(shaderPath)))
         panic("Failed to load shader %s\n", shaderPath);
     uint64_t buildFinishTicks = SDL_GetTicksNS();
     run.buildTime = (buildFinishTicks-buildStartTicks) * 1e-9;
